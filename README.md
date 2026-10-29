@@ -80,6 +80,17 @@ The interface uses the supplied palette: mint `#CAE4DB`, warm stone `#CDC7BE`, d
 
 3. Confirm the Gemini API is enabled for the Google Cloud project behind the key and that the chosen Gemini model is available to it. Missing keys, rate limits, and provider failures are reported in the app.
 
+## Deploy to Cloudflare Workers
+
+The included `worker.ts` supports Cloudflare Worker runtime variables. In Cloudflare → Workers & Pages → your Worker → Settings → Variables and Secrets, add:
+
+- `SUPABASE_URL` — the project URL
+- `SUPABASE_ANON_KEY` — the public anon/publishable key (or use `SUPABASE_PUBLISHABLE_KEY`)
+
+The Worker injects only these public values into the HTML response at request time. Do not configure or expose a service-role key. After setting variables, redeploy the Worker. For a Git-connected deployment, use `npm run deploy` as the deploy command; it type-checks and builds the Vite app, then deploys the static assets and Worker entry point via Wrangler. The `SUPABASE_URL`/`SUPABASE_ANON_KEY` Worker runtime bindings are supported directly, as are `VITE_SUPABASE_URL`/`VITE_SUPABASE_ANON_KEY`.
+
+The Gemini API key stays exclusively in Supabase Edge Function secrets; it is not a Cloudflare frontend variable.
+
 ## Deploy to Vercel
 
 1. Import the repository into Vercel and select the **Vite** framework preset.
