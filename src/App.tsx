@@ -181,6 +181,27 @@ function App() {
   useEffect(() => {
     if (!supabase || !user) return;
     const client = supabase;
+    const channel = client.channel(`conversation-list-${user.id}`)
+      .on("postgres_changes", {
+        event: "INSERT",
+        schema: "public",
+        table: "messages",
+      }, () => {
+        void loadConversations();
+      })
+      .subscribe((status) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          setNotice({ kind: "error", text: "Conversation list live updates are unavailable. Check that the messages table is enabled in Supabase Realtime." });
+        }
+      });
+    return () => {
+      void client.removeChannel(channel);
+    };
+  }, [user?.id, loadConversations]);
+
+  useEffect(() => {
+    if (!supabase || !user) return;
+    const client = supabase;
     const query = searchText.trim();
     if (query.length < 2) {
       setSearchResults([]);
@@ -233,6 +254,8 @@ function App() {
     }
     const client = supabase;
     let cancelled = false;
+    let historyLoaded = false;
+    setMessages([]);
     const loadMessages = async () => {
       const { data, error } = await client.from("messages").select("*")
         .eq("conversation_id", activeConversationId)
@@ -243,9 +266,11 @@ function App() {
         setNotice({ kind: "error", text: `Could not load messages: ${error.message}` });
         return;
       }
-      setMessages([...(data ?? [])].reverse());
+      const history = [...(data ?? [])].reverse();
+      setMessages((existing) => [...new Map(
+        [...existing, ...history].map((message) => [message.id, message]),
+      ).values()].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at)));
     };
-    void loadMessages();
     const channel = client.channel(`conversation-${activeConversationId}`)
       .on("postgres_changes", {
         event: "INSERT",
@@ -254,10 +279,15 @@ function App() {
         filter: `conversation_id=eq.${activeConversationId}`,
       }, (payload) => {
         const incoming = payload.new as DirectMessage;
-        setMessages((existing) => existing.some((item) => item.id === incoming.id) ? existing : [...existing, incoming]);
-        void loadConversations();
+        setMessages((existing) => [...new Map(
+          [...existing, incoming].map((message) => [message.id, message]),
+        ).values()].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at)));
       })
       .subscribe((status) => {
+        if (status === "SUBSCRIBED" && !historyLoaded) {
+          historyLoaded = true;
+          void loadMessages();
+        }
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
           setNotice({ kind: "error", text: "Live updates are unavailable. Check that the messages table is enabled in Supabase Realtime." });
         }
@@ -266,7 +296,7 @@ function App() {
       cancelled = true;
       void client.removeChannel(channel);
     };
-  }, [activeConversationId, user?.id, loadConversations]);
+  }, [activeConversationId, user?.id]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });

@@ -115,11 +115,14 @@ Deno.serve(async (request: Request) => {
       .filter((memory) => memory.score > 0 || memories.length <= 8);
     const priorMessages = (historyResult.data ?? []).reverse() as HistoryMessage[];
 
-    const { error: saveUserError } = await client.from("ai_messages").insert({
-      user_id: user.id,
-      role: "user",
-      content: message,
-    });
+    const { data: savedUserMessage, error: saveUserError } = await client.from("ai_messages")
+      .insert({
+        user_id: user.id,
+        role: "user",
+        content: message,
+      })
+      .select("id")
+      .single();
     if (saveUserError) throw saveUserError;
 
     const system = [
@@ -145,6 +148,11 @@ Deno.serve(async (request: Request) => {
       reply = await askGemini(apiKey, system, contents);
     } catch (error) {
       console.error("Gemini request failed:", error);
+      const { error: cleanupError } = await client.from("ai_messages")
+        .delete()
+        .eq("id", savedUserMessage.id)
+        .eq("user_id", user.id);
+      if (cleanupError) console.error("Could not remove the failed request from AI history:", cleanupError);
       const providerStatus = (error as Error & { status?: number }).status;
       if (providerStatus === 429) return jsonResponse({ error: "The AI service is busy. Please wait a moment and try again." }, 429);
       return jsonResponse({ error: "Your message could not reach the AI service. Check the Gemini configuration and try again." }, 502);
