@@ -78,7 +78,7 @@ The interface uses the supplied palette: mint `#CAE4DB`, warm stone `#CDC7BE`, d
 
    JWT verification is enabled in `supabase/config.toml`. The function verifies the user, reads their own saved profile/memories/history under RLS, calls Gemini server-side, and saves both sides of the AI conversation. It only sends a short recent history and a small set of relevant memories. Memory extraction is limited to concise, user-stated durable facts, and credential-like memories are rejected.
 
-3. Confirm the Gemini API is enabled for the Google Cloud project behind the key and that the chosen Gemini model is available to it. Missing keys, rate limits, and provider failures are reported in the app.
+3. Confirm the Gemini API is enabled for the Google Cloud project behind the key. The function defaults to the current `gemini-3.8-flash` model. If your API project uses a different supported text model, set the optional `GEMINI_MODEL` Supabase secret to that model ID. Missing keys, rate limits, and provider failures are reported in the app.
 
 ## Deploy to Cloudflare Workers
 
