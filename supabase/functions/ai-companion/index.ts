@@ -19,30 +19,66 @@ type GeminiResponse = {
   error?: { message?: string; status?: string };
 };
 
+class GeminiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly httpStatus: number,
+    readonly providerStatus?: string,
+  ) {
+    super(message);
+    this.name = "GeminiRequestError";
+  }
+}
+
 const jsonResponse = (body: Record<string, unknown>, status = 200) =>
   new Response(JSON.stringify(body), {
     status,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 
-async function askGemini(apiKey: string, system: string, contents: Array<{ role: string; parts: Array<{ text: string }> }>) {
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: system }] },
-        contents,
-        generationConfig: { temperature: 0.7, maxOutputTokens: 1200 },
-      }),
-    },
-  );
-  const payload = (await response.json()) as GeminiResponse;
-  if (!response.ok) {
-    const error = new Error(payload.error?.message ?? "The AI provider could not complete the request.");
-    Object.assign(error, { status: response.status });
+async function askGemini(
+  apiKey: string,
+  model: string,
+  system: string,
+  contents: Array<{ role: string; parts: Array<{ text: string }> }>,
+  timeoutMs = 25_000,
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let response: Response;
+  let payload: GeminiResponse;
+  try {
+    response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: system }] },
+          contents,
+          generationConfig: { temperature: 0.7, maxOutputTokens: 1200 },
+        }),
+        signal: controller.signal,
+      },
+    );
+    payload = (await response.json()) as GeminiResponse;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new GeminiRequestError("Gemini did not respond before the request timed out.", 504, "TIMEOUT");
+    }
+    if (error instanceof SyntaxError) {
+      throw new GeminiRequestError("Gemini returned an unreadable response.", 502, "INVALID_RESPONSE");
+    }
     throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!response.ok) {
+    throw new GeminiRequestError(
+      payload.error?.message ?? "The AI provider could not complete the request.",
+      response.status,
+      payload.error?.status,
+    );
   }
   const text = payload.candidates?.[0]?.content?.parts
     ?.map((part) => part.text ?? "")
@@ -58,6 +94,7 @@ Deno.serve(async (request: Request) => {
 
   const authorization = request.headers.get("Authorization");
   const apiKey = Deno.env.get("GEMINI_API_KEY");
+  const model = Deno.env.get("GEMINI_MODEL")?.trim() || "gemini-3.1-flash-lite";
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? Deno.env.get("SUPABASE_PUBLISHABLE_KEY");
   if (!apiKey) return jsonResponse({ error: "The Gemini API key is not configured for this project." }, 503);
@@ -145,17 +182,44 @@ Deno.serve(async (request: Request) => {
 
     let reply: string;
     try {
-      reply = await askGemini(apiKey, system, contents);
+      reply = await askGemini(apiKey, model, system, contents);
     } catch (error) {
-      console.error("Gemini request failed:", error);
+      if (error instanceof GeminiRequestError) {
+        console.error("Gemini request failed:", {
+          httpStatus: error.httpStatus,
+          providerStatus: error.providerStatus,
+          message: error.message,
+        });
+      } else {
+        console.error("Gemini request failed before receiving a provider response:", error);
+      }
       const { error: cleanupError } = await client.from("ai_messages")
         .delete()
         .eq("id", savedUserMessage.id)
         .eq("user_id", user.id);
       if (cleanupError) console.error("Could not remove the failed request from AI history:", cleanupError);
-      const providerStatus = (error as Error & { status?: number }).status;
-      if (providerStatus === 429) return jsonResponse({ error: "The AI service is busy. Please wait a moment and try again." }, 429);
-      return jsonResponse({ error: "Your message could not reach the AI service. Check the Gemini configuration and try again." }, 502);
+      if (error instanceof GeminiRequestError) {
+        if (error.httpStatus === 429) {
+          return jsonResponse({ error: "Gemini is rate-limiting requests. Wait a minute and try again." }, 429);
+        }
+        if (error.httpStatus === 400 || error.httpStatus === 401 || error.httpStatus === 403) {
+          return jsonResponse({
+            error: "Gemini rejected its API key or request. Check that GEMINI_API_KEY in Supabase is current, the Generative Language API is enabled, and the key has permission to use Gemini.",
+          }, 502);
+        }
+        if (error.httpStatus === 404) {
+          return jsonResponse({
+            error: `The configured Gemini model (${model}) is unavailable to this API key. Check that the model is supported by your Gemini API project or set the GEMINI_MODEL Supabase secret to a supported text model.`,
+          }, 502);
+        }
+        if (error.providerStatus === "TIMEOUT") {
+          return jsonResponse({ error: "Gemini took too long to respond. Please try again; if it keeps happening, check the Gemini API project and model access." }, 504);
+        }
+        if (error.httpStatus >= 500) {
+          return jsonResponse({ error: "Gemini is temporarily unavailable. Please try again in a few minutes." }, 502);
+        }
+      }
+      return jsonResponse({ error: "The AI request failed before Gemini returned a response. Check the Supabase Edge Function logs and try again." }, 502);
     }
 
     const { error: saveReplyError } = await client.from("ai_messages").insert({
@@ -165,10 +229,12 @@ Deno.serve(async (request: Request) => {
     });
     if (saveReplyError) throw saveReplyError;
 
-    try {
-      const extraction = await askGemini(apiKey,
+    EdgeRuntime.waitUntil((async () => {
+      try {
+        const extraction = await askGemini(apiKey, model,
         "Extract at most two concise, durable personal facts or preferences explicitly stated by the user. Return only a JSON array with objects shaped as {\"content\":\"...\",\"category\":\"...\"}. Never include temporary details, guesses, secrets, passwords, API keys, credentials, or sensitive financial/medical identifiers. Return [] if there is nothing useful.",
         [{ role: "user", parts: [{ text: `User message:\n${message}\n\nAssistant response:\n${reply}` }] }],
+        10_000,
       );
       const parsed = JSON.parse(extraction.replace(/^```(?:json)?\s*|\s*```$/g, "")) as unknown;
       if (Array.isArray(parsed)) {
@@ -194,6 +260,7 @@ Deno.serve(async (request: Request) => {
     } catch (error) {
       console.error("AI reply saved, but memory extraction failed:", error);
     }
+    })());
 
     return jsonResponse({ reply });
   } catch (error) {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import {
   ArrowLeft, Check, ChevronRight, Clock3, Eye, EyeOff, LoaderCircle, LogOut,
-  MessageCircle, MessagesSquare, Plus, Search, Send, Settings2, Shuffle,
+  MessageCircle, MessagesSquare, Palette, Plus, Search, Send, Settings2, Shuffle, ZoomIn,
   Sparkles, Trash2, X,
 } from "lucide-react";
 import { FunctionsHttpError, type Session } from "@supabase/supabase-js";
@@ -11,6 +11,21 @@ import { isSupabaseConfigured, supabase } from "./lib/supabase";
 
 type Notice = { kind: "success" | "error" | "info"; text: string };
 type Section = "list" | "chat" | "ai";
+type PaletteId = "vintage" | "lavender" | "ocean" | "forest";
+const palettes: Array<{ id: PaletteId; label: string; colors: [string, string, string] }> = [
+  { id: "vintage", label: "Vintage", colors: ["#292321", "#cae4db", "#87a7b3"] },
+  { id: "lavender", label: "Lavender", colors: ["#25212d", "#d9c9f4", "#b8a2df"] },
+  { id: "ocean", label: "Ocean", colors: ["#1e262b", "#b9deeb", "#78aec1"] },
+  { id: "forest", label: "Forest", colors: ["#222923", "#c5e0c8", "#86b49a"] },
+];
+const readUiPreference = <T extends string>(key: string, allowed: readonly T[], fallback: T): T => {
+  try {
+    const value = localStorage.getItem(key);
+    return value && allowed.includes(value as T) ? value as T : fallback;
+  } catch {
+    return fallback;
+  }
+};
 type ConversationSummary = {
   conversation: DirectConversation;
   other: Profile;
@@ -67,8 +82,30 @@ function App() {
   const [avatarSeed, setAvatarSeed] = useState(randomAvatarSeed);
   const [showPassword, setShowPassword] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [palette, setPalette] = useState<PaletteId>(() =>
+    readUiPreference("vartalaap-palette", palettes.map((item) => item.id), "vintage"));
+  const [uiZoom, setUiZoom] = useState<string>(() =>
+    readUiPreference("vartalaap-zoom", ["80", "90", "100", "110", "120"], "100"));
   const bottomRef = useRef<HTMLDivElement>(null);
+  const accountSettingsRef = useRef<HTMLDivElement>(null);
   const user = session?.user ?? null;
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!accountSettingsRef.current?.contains(event.target as Node)) setSettingsOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setSettingsOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [settingsOpen]);
 
   useEffect(() => {
     if (!supabase) {
@@ -313,6 +350,14 @@ function App() {
     avatar_path: null,
   };
 
+  function saveUiPreference(key: string, value: string) {
+    try {
+      localStorage.setItem(key, value);
+    } catch {
+      setNotice({ kind: "error", text: "This setting is active, but your browser could not save it for your next visit." });
+    }
+  }
+
   async function handleAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!supabase) return;
@@ -419,37 +464,57 @@ function App() {
     event?.preventDefault();
     const content = aiDraft.trim();
     if (!supabase || !content || aiSending) return;
+    const client = supabase;
     setAiSending(true);
     setAiDraft("");
-    const { data, error } = await supabase.functions.invoke<{ reply: string }>("ai-companion", {
-      body: { message: content },
-    });
-    setAiSending(false);
-    if (error) {
-      setAiDraft(content);
-      let reason = error.message;
-      if (error instanceof FunctionsHttpError) {
-        try {
-          const response = await error.context.json() as { error?: unknown };
-          if (typeof response.error === "string" && response.error) reason = response.error;
-        } catch (responseError) {
-          console.error("Could not read the AI function error response:", responseError);
-        }
-      }
-      setNotice({
-        kind: "error",
-        text: `Your companion could not reply: ${reason}`,
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 35_000);
+    try {
+      const invokeCompanion = () => client.functions.invoke<{ reply: string }>("ai-companion", {
+        body: { message: content },
+        signal: controller.signal,
       });
-      await loadAiHistory();
-      return;
-    }
-    if (!data?.reply) {
+      let result = await invokeCompanion();
+      if (result.error instanceof FunctionsHttpError && result.error.context.status === 401) {
+        const { data: refreshed, error: refreshError } = await client.auth.refreshSession();
+        if (refreshError || !refreshed.session) {
+          await client.auth.signOut({ scope: "local" });
+          setAiDraft(content);
+          setNotice({ kind: "error", text: "Your sign-in expired. Please sign in again to talk with your companion." });
+          return;
+        }
+        result = await invokeCompanion();
+      }
+      const { data, error } = result;
+      if (error) {
+        setAiDraft(content);
+        let reason = error.message;
+        if (error instanceof FunctionsHttpError) {
+          try {
+            const response = await error.context.json() as { error?: unknown };
+            if (typeof response.error === "string" && response.error) reason = response.error;
+          } catch (responseError) {
+            console.error("Could not read the AI function error response:", responseError);
+          }
+        }
+        setNotice({ kind: "error", text: `Your companion could not reply: ${reason}` });
+      } else if (!data?.reply) {
+        setAiDraft(content);
+        setNotice({ kind: "error", text: "Your companion returned an empty reply. Please try again." });
+      } else {
+        setNotice(null);
+      }
+    } catch (error) {
       setAiDraft(content);
-      setNotice({ kind: "error", text: "Your companion returned an empty reply. Please try again." });
-      await loadAiHistory();
-      return;
+      const reason = controller.signal.aborted
+        ? "The request timed out. Please try again; if it keeps happening, check the Gemini API project and model access."
+        : error instanceof Error ? error.message : "The request could not reach the AI service.";
+      console.error("AI companion request could not be completed:", error);
+      setNotice({ kind: "error", text: `Your companion could not reply: ${reason}` });
+    } finally {
+      window.clearTimeout(timeout);
+      setAiSending(false);
     }
-    setNotice(null);
     await loadAiHistory();
   }
 
@@ -527,7 +592,16 @@ function App() {
   }
 
   return (
-    <div className={`app-shell ${section !== "list" ? "mobile-in-section" : ""}`}>
+    <div
+      className={`app-shell ${section !== "list" ? "mobile-in-section" : ""}`}
+      data-palette={palette}
+      style={{
+        transform: `scale(${Number(uiZoom) / 100})`,
+        transformOrigin: "top left",
+        width: `${10000 / Number(uiZoom)}%`,
+        height: `${10000 / Number(uiZoom)}dvh`,
+      }}
+    >
       <aside className="sidebar">
         <div className="brand-lockup">
           <div className="brand-seal"><MessageCircle size={20} strokeWidth={1.8} /></div>
@@ -584,10 +658,63 @@ function App() {
             <span><strong>My AI companion</strong><small>A little space just for you</small></span>
             <ChevronRight size={16} className="ai-chevron" />
           </button>
-          <div className="account-card">
-            <Avatar profile={signedInAvatar} size="small" />
+          <div className="account-card" ref={accountSettingsRef}>
+            <button
+              className="account-avatar-button"
+              onClick={() => setSettingsOpen((open) => !open)}
+              aria-label="Open appearance settings"
+              aria-expanded={settingsOpen}
+              aria-controls="appearance-settings"
+              title="Appearance settings"
+            >
+              <Avatar profile={signedInAvatar} size="small" />
+            </button>
             <span className="account-copy"><strong>{signedInName}</strong><small>Your private account</small></span>
             <button className="icon-button logout-button" onClick={() => void signOut()} title="Sign out" aria-label="Sign out"><LogOut size={17} /></button>
+            {settingsOpen && (
+              <section className="appearance-menu" id="appearance-settings" aria-label="Appearance settings">
+                <div className="appearance-menu-heading"><Settings2 size={15} /><strong>Appearance</strong></div>
+                <div className="appearance-setting">
+                  <span className="appearance-setting-title"><Palette size={14} /> Color palette</span>
+                  <div className="palette-options" role="group" aria-label="Color palette">
+                    {palettes.map((option) => (
+                      <button
+                        key={option.id}
+                        className={`palette-option ${palette === option.id ? "selected" : ""}`}
+                        onClick={() => {
+                          setPalette(option.id);
+                          saveUiPreference("vartalaap-palette", option.id);
+                        }}
+                        aria-label={`${option.label} palette`}
+                        aria-pressed={palette === option.id}
+                        title={option.label}
+                      >
+                        <span className="palette-swatch" aria-hidden="true">
+                          {option.colors.map((color) => <i key={color} style={{ backgroundColor: color }} />)}
+                        </span>
+                        <small>{option.label}</small>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <label className="appearance-setting zoom-setting">
+                  <span className="appearance-setting-title"><ZoomIn size={14} /> Interface size <strong>{uiZoom}%</strong></span>
+                  <input
+                    type="range"
+                    min="80"
+                    max="120"
+                    step="10"
+                    value={uiZoom}
+                    onChange={(event) => {
+                      setUiZoom(event.target.value);
+                      saveUiPreference("vartalaap-zoom", event.target.value);
+                    }}
+                    aria-label="Interface zoom"
+                  />
+                  <span className="zoom-labels"><small>Smaller</small><small>Larger</small></span>
+                </label>
+              </section>
+            )}
           </div>
         </div>
       </aside>
