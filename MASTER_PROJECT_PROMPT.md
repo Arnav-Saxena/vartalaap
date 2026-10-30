@@ -1,4 +1,4 @@
-# Vartalaap — Master Project Prompt
+# Vartalaap - Master Project Prompt
 
 Build and maintain **Vartalaap**, a deployable, mobile-first and desktop-friendly browser messaging product. It combines real person-to-person messaging with a private, personalized AI companion for every registered user. This is a working application, not a static prototype.
 
