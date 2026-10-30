@@ -1,0 +1,23 @@
+revoke all on function public.is_mandali_member(uuid) from anon, public;
+revoke all on function public.shares_mandali_with(uuid) from anon, public;
+revoke all on function public.create_mandali(text, text, text, text) from anon, public;
+revoke all on function public.join_mandali(uuid) from anon, public;
+revoke all on function public.leave_mandali(uuid) from anon, public;
+revoke all on function public.create_mandali_invite(uuid) from anon, public;
+revoke all on function public.join_mandali_by_invite(text) from anon, public;
+revoke all on function public.remove_mandali_member(uuid, uuid) from anon, public;
+revoke all on function public.update_mandali(uuid, text, text, text, text) from anon, public;
+revoke all on function public.transfer_mandali_ownership(uuid, uuid) from anon, public;
+revoke all on function public.delete_mandali(uuid) from anon, public;
+
+grant execute on function public.is_mandali_member(uuid) to authenticated;
+grant execute on function public.shares_mandali_with(uuid) to authenticated;
+grant execute on function public.create_mandali(text, text, text, text) to authenticated;
+grant execute on function public.join_mandali(uuid) to authenticated;
+grant execute on function public.leave_mandali(uuid) to authenticated;
+grant execute on function public.create_mandali_invite(uuid) to authenticated;
+grant execute on function public.join_mandali_by_invite(text) to authenticated;
+grant execute on function public.remove_mandali_member(uuid, uuid) to authenticated;
+grant execute on function public.update_mandali(uuid, text, text, text, text) to authenticated;
+grant execute on function public.transfer_mandali_ownership(uuid, uuid) to authenticated;
+grant execute on function public.delete_mandali(uuid) to authenticated;

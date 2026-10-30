@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import {
-  ArrowLeft, Check, ChevronRight, Clock3, Eye, EyeOff, LoaderCircle, LogOut,
+  ArrowLeft, Check, ChevronRight, Clock3, Eye, EyeOff, Gamepad2, LoaderCircle, LogOut,
   MessageCircle, MessagesSquare, Palette, Plus, Search, Send, Settings2, Shuffle, ZoomIn,
-  Sparkles, Trash2, X,
+  Sparkles, Trash2, UsersRound, X,
 } from "lucide-react";
 import { FunctionsHttpError, type Session } from "@supabase/supabase-js";
 import type { AiMemory, AiMessage, AiProfile, DirectConversation, DirectMessage, Profile } from "./lib/database.types";
 import { avatarUrl, randomAvatarSeed, uploadAvatar } from "./lib/avatar";
 import { isSupabaseConfigured, supabase } from "./lib/supabase";
+import { MandaliSection } from "./components/MandaliSection";
+import { DirectBoardGamePicker, paperGamesPlayUrl, type BoardGame } from "./components/DirectBoardGamePicker";
 
 type Notice = { kind: "success" | "error" | "info"; text: string };
-type Section = "list" | "chat" | "ai";
+type Section = "list" | "chat" | "ai" | "mandali";
 type PaletteId = "vintage" | "lavender" | "ocean" | "forest";
 const palettes: Array<{ id: PaletteId; label: string; colors: [string, string, string] }> = [
   { id: "vintage", label: "Vintage", colors: ["#292321", "#cae4db", "#87a7b3"] },
@@ -31,6 +33,26 @@ type ConversationSummary = {
   other: Profile;
   lastMessage: DirectMessage | null;
 };
+
+function renderMessageContent(content: string, onOpenGame: (url: string, gameName: string) => void) {
+  const gameUrlPattern = /^https:\/\/papergames\.io\/en\/r\/[A-Za-z0-9_-]+\/embed\/play$/i;
+  const gameName = content.match(/🎮 ([^:]+) invite:/)?.[1] ?? "PaperGames game";
+  return content.split(/(https?:\/\/[^\s]+)/gi).map((part, index) => {
+    if (!/^https?:\/\//i.test(part)) return part;
+    if (gameUrlPattern.test(part)) {
+      const safeUrl = paperGamesPlayUrl(part);
+      return safeUrl
+        ? <button className="game-invite-link" key={`${index}-${safeUrl.href}`} onClick={() => onOpenGame(safeUrl.href, gameName)}>🎮 Join game</button>
+        : part;
+    }
+    try {
+      const url = new URL(part);
+      return <a key={`${index}-${url.href}`} href={url.href} target="_blank" rel="noopener noreferrer">{part}</a>;
+    } catch {
+      return part;
+    }
+  });
+}
 
 const defaultAiProfile = (userId: string): AiProfile => ({
   user_id: userId,
@@ -64,6 +86,11 @@ function App() {
   const [messages, setMessages] = useState<DirectMessage[]>([]);
   const [messageDraft, setMessageDraft] = useState("");
   const [isSending, setIsSending] = useState(false);
+  const [deletingMessageId, setDeletingMessageId] = useState<string | null>(null);
+  const [boardGamePickerOpen, setBoardGamePickerOpen] = useState(false);
+  const [paperGamesUrl, setPaperGamesUrl] = useState<string | null>(null);
+  const [paperGamesName, setPaperGamesName] = useState<string | null>(null);
+  const [creatingPaperGamesGame, setCreatingPaperGamesGame] = useState<string | null>(null);
   const [searchText, setSearchText] = useState("");
   const [searchResults, setSearchResults] = useState<Profile[]>([]);
   const [searching, setSearching] = useState(false);
@@ -320,6 +347,16 @@ function App() {
           [...existing, incoming].map((message) => [message.id, message]),
         ).values()].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at)));
       })
+      .on("postgres_changes", {
+        event: "DELETE",
+        schema: "public",
+        table: "messages",
+      }, (payload) => {
+        const deletedId = payload.old.id;
+        if (typeof deletedId === "string") {
+          setMessages((existing) => existing.filter((message) => message.id !== deletedId));
+        }
+      })
       .subscribe((status) => {
         if (status === "SUBSCRIBED" && !historyLoaded) {
           historyLoaded = true;
@@ -334,6 +371,12 @@ function App() {
       void client.removeChannel(channel);
     };
   }, [activeConversationId, user?.id]);
+
+  useEffect(() => {
+    setBoardGamePickerOpen(false);
+    setPaperGamesUrl(null);
+    setPaperGamesName(null);
+  }, [activeConversationId, section]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -437,6 +480,81 @@ function App() {
     }
     setMessageDraft("");
     void loadConversations();
+  }
+
+  async function deleteDirectMessage(message: DirectMessage) {
+    if (!supabase || !user || deletingMessageId || !window.confirm("Delete this message for everyone in the conversation?")) return;
+    setDeletingMessageId(message.id);
+    const { data, error } = await supabase.from("messages")
+      .delete()
+      .eq("id", message.id)
+      .eq("sender_id", user.id)
+      .select("id")
+      .single();
+    setDeletingMessageId(null);
+    if (error) {
+      setNotice({ kind: "error", text: `Could not delete the message: ${error.message}` });
+      return;
+    }
+    if (!data) {
+      setNotice({ kind: "error", text: "The message was not found or you do not have permission to delete it." });
+      return;
+    }
+    setMessages((existing) => existing.filter((item) => item.id !== data.id));
+    setNotice({ kind: "success", text: "Message deleted for everyone in this conversation." });
+    void loadConversations();
+  }
+
+  async function createPaperGamesSession(game: BoardGame) {
+    if (!supabase || !user || !activeConversationId || creatingPaperGamesGame) return;
+    setCreatingPaperGamesGame(game.gameType);
+    try {
+      const { data, error } = await supabase.functions.invoke<{ uid: string; playUrl: string }>("papergames-game-session", {
+        body: { gameType: game.gameType, conversationId: activeConversationId },
+      });
+      if (error) throw error;
+      const safeUrl = data && paperGamesPlayUrl(data.playUrl);
+      if (!data || !safeUrl) throw new Error("PaperGames returned an invalid game link.");
+
+      const url = safeUrl.toString();
+      setPaperGamesUrl(url);
+      setPaperGamesName(game.name);
+      const { error: messageError } = await supabase.from("messages").insert({
+        conversation_id: activeConversationId,
+        sender_id: user.id,
+        content: `🎮 ${game.name} invite: ${url}`,
+      });
+      if (messageError) {
+        setNotice({ kind: "error", text: `The game was created, but its invite could not be sent in the DM: ${messageError.message}` });
+        return;
+      }
+      void loadConversations();
+    } catch (error) {
+      let reason = error instanceof Error ? error.message : "Please try again.";
+      if (error instanceof FunctionsHttpError) {
+        try {
+          const response = await error.context.clone().json() as { error?: unknown };
+          if (typeof response.error === "string" && response.error) reason = response.error;
+        } catch (responseError) {
+          console.error("Could not read the PaperGames function error response:", responseError);
+          reason = `Game session service returned HTTP ${error.context.status}.`;
+        }
+      }
+      setNotice({ kind: "error", text: `Could not create the PaperGames session: ${reason}` });
+    } finally {
+      setCreatingPaperGamesGame(null);
+    }
+  }
+
+  function openPaperGamesInvite(url: string, gameName: string) {
+    const safeUrl = paperGamesPlayUrl(url);
+    if (!safeUrl) {
+      setNotice({ kind: "error", text: "This PaperGames invite link is invalid." });
+      return;
+    }
+    setPaperGamesUrl(safeUrl.toString());
+    setPaperGamesName(gameName);
+    setBoardGamePickerOpen(true);
   }
 
   function onDirectMessageKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -566,7 +684,7 @@ function App() {
     setAiMemories((current) => current.filter((memory) => memory.id !== memoryId));
   }
 
-  if (!isSupabaseConfigured) return <SetupScreen />;
+  if (!isSupabaseConfigured || !supabase) return <SetupScreen />;
   if (!authReady) return <div className="boot-screen"><LoaderCircle className="spin" size={22} /> Opening Vartalaap…</div>;
   if (!user) {
     return (
@@ -653,6 +771,11 @@ function App() {
         </div>
 
         <div className="sidebar-lower">
+          <button className={`mandali-launch ${section === "mandali" ? "active" : ""}`} onClick={() => setSection("mandali")}>
+            <span className="mandali-launch-icon"><UsersRound size={16} /></span>
+            <span><strong>Mandali</strong><small>Gather with your people</small></span>
+            <ChevronRight size={16} className="ai-chevron" />
+          </button>
           <button className={`ai-launch ${section === "ai" ? "active" : ""}`} onClick={() => setSection("ai")}>
             <span className="ai-orb"><Sparkles size={17} /></span>
             <span><strong>My AI companion</strong><small>A little space just for you</small></span>
@@ -721,7 +844,9 @@ function App() {
 
       <main className="workspace">
         {notice && <NoticeBanner notice={notice} onDismiss={() => setNotice(null)} />}
-        {section === "chat" ? (
+        {section === "mandali" ? (
+          <MandaliSection client={supabase} user={user} onBack={() => setSection("list")} />
+        ) : section === "chat" ? (
           <section className="chat-pane">
             {activeConversation ? (
               <>
@@ -729,6 +854,13 @@ function App() {
                   <button className="icon-button mobile-back" onClick={() => setSection("list")} aria-label="Back to conversations"><ArrowLeft size={19} /></button>
                   <Avatar profile={activeConversation.other} size="normal" />
                   <div className="chat-header-copy"><h1>{activeConversation.other.display_name}</h1><p>Private conversation</p></div>
+                  <button className="icon-button board-game-trigger" onClick={() => {
+                    setPaperGamesUrl(null);
+                    setPaperGamesName(null);
+                    setBoardGamePickerOpen(true);
+                  }} aria-label={`Play a board game with ${activeConversation.other.display_name}`} title="Play a board game">
+                    <Gamepad2 size={18} />
+                  </button>
                   <div className="header-decoration"><span>V</span> VARTALAAP LETTERS</div>
                 </header>
                 <div className="messages-area">
@@ -737,8 +869,12 @@ function App() {
                     return (
                       <div className={`message-row ${mine ? "mine" : "theirs"}`} key={message.id}>
                         <article className={`message-bubble ${mine ? "bubble-mine" : "bubble-theirs"}`}>
-                          <div className="message-byline">{mine ? "You" : activeConversation.other.display_name}<time>{formatTime(message.created_at)}</time></div>
-                          <p>{message.content}</p>
+                          <div className="message-byline">
+                            <span>{mine ? "You" : activeConversation.other.display_name}</span>
+                            <time>{formatTime(message.created_at)}</time>
+                            {mine && <button className="message-delete-button" onClick={() => void deleteDirectMessage(message)} disabled={deletingMessageId === message.id} aria-label="Delete your message" title="Delete for everyone"><Trash2 size={13} /></button>}
+                          </div>
+                          <p>{renderMessageContent(message.content, openPaperGamesInvite)}</p>
                         </article>
                       </div>
                     );
@@ -769,6 +905,15 @@ function App() {
                   </div>
                   <div className="composer-hint">ENTER TO SEND <span>·</span> SHIFT + ENTER FOR A NEW LINE</div>
                 </form>
+                {boardGamePickerOpen && <DirectBoardGamePicker
+                  otherName={activeConversation.other.display_name}
+                  username={profile?.display_name || String(user.user_metadata.display_name ?? "Vartalaap player")}
+                  gameUrl={paperGamesUrl}
+                  gameName={paperGamesName}
+                  creatingGame={creatingPaperGamesGame}
+                  onChoose={(game) => void createPaperGamesSession(game)}
+                  onClose={() => setBoardGamePickerOpen(false)}
+                />}
               </>
             ) : (
               <WelcomePane onFindPeople={() => document.querySelector<HTMLInputElement>(".people-search input")?.focus()} />

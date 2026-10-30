@@ -1,2 +1,8 @@
 [functions.ai-companion]
 verify_jwt = true
+
+[functions.mandali-voice-token]
+verify_jwt = false
+
+[functions.papergames-game-session]
+verify_jwt = true
